@@ -48,17 +48,28 @@
 .PARAMETER SkipCertCheck
     Disable TLS certificate validation (insecure). Prefer installing the Russian root CA instead.
 
-.PARAMETER NoProxy
-    Ignore the system proxy settings. Helps when a stale proxy is left behind by a VPN client.
+.PARAMETER UseSystemProxy
+    Use the system proxy for GigaChat requests. By default the proxy is bypassed, because stale
+    proxy entries left behind by VPN clients break direct access.
+
+.PARAMETER SetKey
+    Prompt for the GigaChat authorization key and store it in the GIGACHAT_AUTH_KEY user variable.
+
+.PARAMETER InitConfig
+    Create the default configuration file in %APPDATA%\ai-flow\config.json.
+
+.PARAMETER Help
+    Show a short usage summary.
 
 .EXAMPLE
-    .\ai-flow.ps1
-    .\ai-flow.ps1 -Branch feat/home-swiper -Lang ru -Draft
-    .\ai-flow.ps1 -DryRun
+    aiflow
+    aiflow -Branch feat/home-swiper -Lang ru -Draft
+    aiflow -DryRun
+    aiflow -SetKey
 #>
 [CmdletBinding()]
 param(
-    [string]$Branch,
+    [Alias('b')][string]$Branch,
     [string]$Base,
     [string]$Remote = 'origin',
     [string]$Model = 'GigaChat-2',
@@ -69,10 +80,13 @@ param(
     [switch]$NoPush,
     [switch]$NoPr,
     [switch]$Draft,
-    [switch]$DryRun,
-    [switch]$Yes,
+    [Alias('dry')][switch]$DryRun,
+    [Alias('y')][switch]$Yes,
     [switch]$SkipCertCheck,
-    [switch]$NoProxy
+    [switch]$UseSystemProxy,
+    [switch]$SetKey,
+    [switch]$InitConfig,
+    [switch]$Help
 )
 
 $ErrorActionPreference = 'Stop'
@@ -84,6 +98,8 @@ $script:AuthKey      = $null
 $script:Token        = $null
 $script:TokenExpires = [datetime]::MinValue
 $script:Utf8NoBom    = New-Object System.Text.UTF8Encoding($false)
+$script:ImperativeMap = $null
+$script:ConfigKeys   = @('Lang', 'Model', 'PrModel', 'Remote', 'Base', 'MaxCodeGroups', 'MaxDiffChars', 'Draft', 'NoPr', 'NoPush', 'Yes')
 
 $script:CategoryMeta = @{
     deps   = @{ Type = 'build'; Scope = 'deps';   Order = 10 }
@@ -264,7 +280,7 @@ function Invoke-HttpJson {
                 0       {
                     $inner = ''
                     if ($ex.InnerException) { $inner = ' / ' + $ex.InnerException.Message }
-                    $hint = ' Если включён или оставался VPN либо прокси, повторите запуск с параметром -NoProxy.'
+                    $hint = ' Проверьте интернет, VPN и антивирус. Если выход в сеть возможен только через прокси, запустите с параметром -UseSystemProxy.'
                     $reason = ('Нет соединения с сервером ({0}): {1}{2}.{3}' -f $ex.GetType().Name, $ex.Message, $inner, $hint)
                 }
                 default { $reason = 'Ошибка запроса (HTTP ' + $status + ').' }
@@ -284,11 +300,8 @@ function Get-AuthKey {
     $key = $env:GIGACHAT_AUTH_KEY
     if ([string]::IsNullOrWhiteSpace($key)) {
         Write-Warn 'Переменная окружения GIGACHAT_AUTH_KEY не задана.'
-        Write-Info 'Чтобы сохранить ключ навсегда: [Environment]::SetEnvironmentVariable(''GIGACHAT_AUTH_KEY'', ''<ключ>'', ''User'')'
-        $secure = Read-Host 'Authorization key GigaChat' -AsSecureString
-        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-        try { $key = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
-        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+        Write-Info 'Чтобы сохранить ключ навсегда, выполните: aiflow -SetKey'
+        $key = Read-Secret -Prompt 'Authorization key GigaChat'
     }
     if ([string]::IsNullOrWhiteSpace($key)) { throw 'Ключ авторизации GigaChat не указан.' }
 
@@ -542,7 +555,7 @@ function New-CommitMessage {
     }
     $rules = @(
         ('Subject language: {0}.' -f (Get-LanguageName)),
-        'Use the imperative mood, start with a lowercase letter, no trailing period.',
+        'Use the imperative mood ("add", "fix", "update") and never the past tense ("added", "fixed"). Start with a lowercase letter, no trailing period.',
         'Keep the subject under 60 characters.',
         'Describe what changed, not which files were touched.',
         'Reply with a single line and nothing else.'
@@ -582,6 +595,7 @@ function New-CommitMessage {
 
     $subject = ConvertTo-Subject -Text $subject -MaxLen 64
     if (-not $subject) { return Get-FallbackMessage -Group $Group }
+    $subject = Set-ImperativeSubject -Text $subject
     return '{0}: {1}' -f $prefix, $subject
 }
 
@@ -679,6 +693,7 @@ function New-PullRequest {
         if ($lines.Count -gt 0) {
             $titleLine = $lines[0] -replace '^(?i)(title|заголовок)\s*:\s*', ''
             $title = ConvertTo-Subject -Text $titleLine -MaxLen 72
+            if ($title) { $title = Set-ImperativeSubject -Text $title }
             if ($lines.Count -gt 1) {
                 $summary = (@($lines | Select-Object -Skip 1) -join "`n").Trim()
                 $summary = $summary -replace '^(?i)(summary|описание)\s*:\s*', ''
@@ -760,17 +775,156 @@ function Show-Plan {
 }
 
 # ---------------------------------------------------------------------------
+# Utility commands, configuration and subject normalisation
+# ---------------------------------------------------------------------------
+
+function Initialize-Console {
+    try { [Console]::OutputEncoding = $script:Utf8NoBom } catch { }
+    $global:OutputEncoding = $script:Utf8NoBom
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+}
+
+function Get-ConfigPath {
+    return (Join-Path $env:APPDATA 'ai-flow\config.json')
+}
+
+function Read-Secret {
+    param([string]$Prompt)
+    $secure = Read-Host $Prompt -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+}
+
+function Save-AuthKey {
+    Write-Info 'Ключ будет сохранён в пользовательскую переменную окружения GIGACHAT_AUTH_KEY.'
+    $key = Read-Secret -Prompt 'Authorization key GigaChat'
+    if ([string]::IsNullOrWhiteSpace($key)) { throw 'Ключ не указан. Ничего не изменено.' }
+    $key = $key.Trim()
+    [Environment]::SetEnvironmentVariable('GIGACHAT_AUTH_KEY', $key, 'User')
+    $env:GIGACHAT_AUTH_KEY = $key
+    Write-Ok 'Ключ сохранён.'
+    Write-Info 'Новые терминалы получат его автоматически. В VS Code перезапустите окно целиком.'
+}
+
+function Initialize-Config {
+    $path = Get-ConfigPath
+    if (Test-Path -LiteralPath $path) {
+        Write-Info ('Файл настроек уже существует: {0}' -f $path)
+        return
+    }
+    $dir = Split-Path -Parent $path
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $content = @(
+        '{',
+        '  "Lang": "en",',
+        '  "Model": "GigaChat-2",',
+        '  "PrModel": "GigaChat-2-Pro",',
+        '  "Remote": "origin",',
+        '  "MaxCodeGroups": 5,',
+        '  "Draft": false',
+        '}'
+    ) -join "`r`n"
+    [System.IO.File]::WriteAllText($path, $content + "`r`n", $script:Utf8NoBom)
+    Write-Ok ('Файл настроек создан: {0}' -f $path)
+    Write-Info 'Параметры командной строки всегда имеют приоритет над файлом.'
+}
+
+function Show-Help {
+    Write-Host ''
+    Write-Host 'AI Git Flow' -ForegroundColor Cyan
+    Write-Host 'Ветка, коммиты и pull request на основе GigaChat'
+    Write-Host ''
+    Write-Host 'Использование: aiflow [параметры]' -ForegroundColor White
+    Write-Host ''
+    $rows = @(
+        @('-Branch, -b <имя>', 'имя новой ветки'),
+        @('-DryRun, -dry', 'показать план, ничего не менять'),
+        @('-Yes, -y', 'не спрашивать подтверждение'),
+        @('-Lang en|ru', 'язык тем коммитов и описания PR'),
+        @('-Draft', 'создать PR как черновик'),
+        @('-NoPr', 'не создавать pull request'),
+        @('-NoPush', 'не отправлять ветку на сервер'),
+        @('-Base <ветка>', 'базовая ветка для PR'),
+        @('-Model, -PrModel', 'модели GigaChat для коммитов и для PR'),
+        @('-UseSystemProxy', 'использовать системный прокси'),
+        @('-SkipCertCheck', 'отключить проверку TLS (небезопасно)'),
+        @('-SetKey', 'сохранить ключ авторизации GigaChat'),
+        @('-InitConfig', 'создать файл настроек по умолчанию'),
+        @('-Help', 'эта справка')
+    )
+    foreach ($row in $rows) {
+        Write-Host ('  {0,-22}' -f $row[0]) -NoNewline -ForegroundColor White
+        Write-Host $row[1] -ForegroundColor Gray
+    }
+    Write-Host ''
+    Write-Host ('Файл настроек: {0}' -f (Get-ConfigPath)) -ForegroundColor DarkGray
+    Write-Host ''
+}
+
+function Get-ImperativeMap {
+    $verbs = @(
+        'add', 'update', 'fix', 'remove', 'implement', 'change', 'create', 'improve', 'refactor',
+        'introduce', 'move', 'rename', 'delete', 'configure', 'enable', 'disable', 'adjust', 'correct',
+        'optimize', 'replace', 'resolve', 'integrate', 'simplify', 'extend', 'use', 'handle', 'apply',
+        'support', 'rewrite', 'clean', 'merge', 'align', 'switch', 'restructure', 'expand', 'reorganize',
+        'document', 'polish', 'tweak', 'harden', 'bump', 'upgrade', 'migrate', 'install', 'include',
+        'ensure', 'prepare', 'build', 'make', 'display', 'show', 'organize', 'rework', 'extract', 'split',
+        'set', 'allow', 'prevent', 'reduce', 'separate', 'initialize', 'define', 'provide', 'streamline'
+    )
+    $map = @{}
+    foreach ($v in $verbs) {
+        if ($v -match '[^aeiou]y$') {
+            $stem = $v.Substring(0, $v.Length - 1)
+            $past = $stem + 'ied'; $third = $stem + 'ies'; $ing = $v + 'ing'
+        }
+        elseif ($v -match 'e$') {
+            $stem = $v.Substring(0, $v.Length - 1)
+            $past = $v + 'd'; $third = $v + 's'; $ing = $stem + 'ing'
+        }
+        elseif ($v -match '(s|x|ch|sh)$') {
+            $past = $v + 'ed'; $third = $v + 'es'; $ing = $v + 'ing'
+        }
+        else {
+            $past = $v + 'ed'; $third = $v + 's'; $ing = $v + 'ing'
+        }
+        foreach ($form in @($past, $third, $ing)) {
+            if (-not $map.ContainsKey($form)) { $map[$form] = $v }
+        }
+    }
+    $map['setting'] = 'set'
+    $map['splitting'] = 'split'
+    $map['built'] = 'build'
+    $map['made'] = 'make'
+    $map['rewrote'] = 'rewrite'
+    $map['rewritten'] = 'rewrite'
+    return $map
+}
+
+function Set-ImperativeSubject {
+    # Models often answer in the past tense ("added x"); Conventional Commits expects "add x".
+    param([string]$Text)
+    if ($Lang -ne 'en' -or [string]::IsNullOrWhiteSpace($Text)) { return $Text }
+    if (-not $script:ImperativeMap) { $script:ImperativeMap = Get-ImperativeMap }
+
+    $m = [regex]::Match($Text, '^((?:[a-z]+(?:\([^)]*\))?!?:\s*)?)([A-Za-z]+)(.*)$')
+    if (-not $m.Success) { return $Text }
+
+    $word = $m.Groups[2].Value.ToLowerInvariant()
+    if ($script:ImperativeMap.ContainsKey($word)) {
+        return $m.Groups[1].Value + $script:ImperativeMap[$word] + $m.Groups[3].Value
+    }
+    return $Text
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 function Start-AiFlow {
-    $console = $script:Utf8NoBom
-    try { [Console]::OutputEncoding = $console } catch { }
-    $global:OutputEncoding = $console
-    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-    if ($NoProxy) {
+    if (-not $UseSystemProxy) {
+        # Stale proxy entries left by VPN clients break direct access to GigaChat.
         [System.Net.WebRequest]::DefaultWebProxy = $null
-        Write-Info 'Системный прокси отключён для этого запуска.'
     }
     if ($SkipCertCheck) {
         Enable-InsecureCertificates
@@ -907,7 +1061,29 @@ function Start-AiFlow {
     }
 }
 
+Initialize-Console
+
+# Defaults from the configuration file; command line parameters always win.
+$configPath = Get-ConfigPath
+if (Test-Path -LiteralPath $configPath) {
+    try {
+        $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($property in $config.PSObject.Properties) {
+            if ($script:ConfigKeys -contains $property.Name -and -not $PSBoundParameters.ContainsKey($property.Name)) {
+                Set-Variable -Name $property.Name -Value $property.Value
+            }
+        }
+    }
+    catch {
+        Write-Warn ('Не удалось прочитать файл настроек {0}: {1}' -f $configPath, $_.Exception.Message)
+    }
+}
+
 try {
+    if ($Help) { Show-Help; exit 0 }
+    if ($SetKey) { Save-AuthKey; exit 0 }
+    if ($InitConfig) { Initialize-Config; exit 0 }
+
     $exitCode = Start-AiFlow | Select-Object -Last 1
     if ($null -eq $exitCode) { $exitCode = 0 }
 }
