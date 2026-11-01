@@ -1,16 +1,16 @@
 ﻿<#
 .SYNOPSIS
-    Automated Git workflow: branch, grouped commits, push and pull request, powered by GigaChat.
+    Git workflow assistant powered by GigaChat: grouped commits, branches, pull requests, README, LICENSE and issues.
 
 .DESCRIPTION
-    The script splits working tree changes into logical commits and writes commit messages
-    and a pull request description with the GigaChat API.
+    Commands (first positional argument, default is "commit"):
+      commit   Split changes into logical commits, push, optionally open a pull request.
+      readme   Generate README.md from the repository contents.
+      license  Create a LICENSE file (MIT, Apache-2.0, GPL-3.0 and others).
+      issue    Turn a short note into a structured GitHub issue.
 
-    Division of responsibilities:
-      * Grouping of files is deterministic (rules by file type and directory), done by the script.
-      * The language model only writes short texts: a commit subject per group and a PR summary.
-
-    Steps: analysis -> plan -> confirmation -> branch -> commits -> push -> pull request (GitHub CLI).
+    Division of responsibilities: grouping of files, license texts and README structure are
+    produced by the script itself; the language model only writes short descriptive texts.
 
 .PARAMETER Branch
     Name of the branch to create. Prompted interactively when omitted.
@@ -48,6 +48,28 @@
 .PARAMETER SkipCertCheck
     Disable TLS certificate validation (insecure). Prefer installing the Russian root CA instead.
 
+.PARAMETER Stay
+    Do not create a branch: commit and push to the current branch (no pull request).
+    The same happens when "." is entered at the branch prompt or passed as -Branch.
+
+.PARAMETER Text
+    Issue command: short description of the problem or task.
+
+.PARAMETER Type
+    License command: license identifier (mit, apache-2.0, gpl-3.0, bsd-3-clause, isc, ...).
+
+.PARAMETER Author
+    License command: copyright holder. Defaults to git config user.name.
+
+.PARAMETER Year
+    License command: copyright year. Defaults to the current year.
+
+.PARAMETER Force
+    Overwrite existing LICENSE / README.md without asking.
+
+.PARAMETER Labels
+    Issue command: comma separated labels. Chosen automatically when omitted.
+
 .PARAMETER UseSystemProxy
     Use the system proxy for GigaChat requests. By default the proxy is bypassed, because stale
     proxy entries left behind by VPN clients break direct access.
@@ -66,9 +88,17 @@
     aiflow -Branch feat/home-swiper -Lang ru -Draft
     aiflow -DryRun
     aiflow -SetKey
+    aiflow -Stay
+    aiflow readme -Lang ru
+    aiflow license -Type mit
+    aiflow issue "Кнопка входа не реагирует на нажатие"
 #>
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
+    [Parameter(Position = 0)]
+    [ValidateSet('commit', 'readme', 'license', 'issue', 'help')]
+    [string]$Command = 'commit',
+    [Parameter(Position = 1)][Alias('t', 'Title')][string]$Text,
     [Alias('b')][string]$Branch,
     [string]$Base,
     [string]$Remote = 'origin',
@@ -77,9 +107,15 @@ param(
     [ValidateSet('en', 'ru')][string]$Lang = 'en',
     [ValidateRange(2, 10)][int]$MaxCodeGroups = 5,
     [ValidateRange(500, 20000)][int]$MaxDiffChars = 6000,
+    [string]$Type,
+    [string]$Author,
+    [int]$Year = (Get-Date).Year,
+    [string[]]$Labels,
+    [Alias('here')][switch]$Stay,
     [switch]$NoPush,
     [switch]$NoPr,
     [switch]$Draft,
+    [switch]$Force,
     [Alias('dry')][switch]$DryRun,
     [Alias('y')][switch]$Yes,
     [switch]$SkipCertCheck,
@@ -99,7 +135,7 @@ $script:Token        = $null
 $script:TokenExpires = [datetime]::MinValue
 $script:Utf8NoBom    = New-Object System.Text.UTF8Encoding($false)
 $script:ImperativeMap = $null
-$script:ConfigKeys   = @('Lang', 'Model', 'PrModel', 'Remote', 'Base', 'MaxCodeGroups', 'MaxDiffChars', 'Draft', 'NoPr', 'NoPush', 'Yes')
+$script:ConfigKeys   = @('Lang', 'Model', 'PrModel', 'Remote', 'Base', 'MaxCodeGroups', 'MaxDiffChars', 'Draft', 'NoPr', 'NoPush', 'Yes', 'Author')
 
 $script:CategoryMeta = @{
     deps   = @{ Type = 'build'; Scope = 'deps';   Order = 10 }
@@ -120,6 +156,147 @@ $script:FallbackSubject = @{
     style  = 'update styles'
     test   = 'update tests'
     docs   = 'update documentation'
+}
+
+$script:LicenseCatalog = [ordered]@{
+    'mit'          = @{ Description = 'Простая и самая популярная: свободное использование, нужно лишь сохранить копирайт.' }
+    'apache-2.0'   = @{ Description = 'Как MIT, плюс явная патентная лицензия. Подходит для крупных проектов.' }
+    'bsd-3-clause' = @{ Description = 'Близка к MIT, запрещает использовать имя автора для рекламы производных продуктов.' }
+    'bsd-2-clause' = @{ Description = 'Упрощённая BSD, по смыслу близка к MIT.' }
+    'isc'          = @{ Description = 'Очень короткая, по смыслу эквивалент MIT.' }
+    'gpl-3.0'      = @{ Description = 'Строгий копилефт: производные работы обязаны оставаться открытыми под GPL.' }
+    'agpl-3.0'     = @{ Description = 'GPL плюс требование открывать код сетевых сервисов.' }
+    'lgpl-3.0'     = @{ Description = 'Слабый копилефт для библиотек: их можно подключать к закрытому коду.' }
+    'mpl-2.0'      = @{ Description = 'Копилефт на уровне отдельных файлов.' }
+    'unlicense'    = @{ Description = 'Общественное достояние: никаких условий.' }
+}
+
+# Short licenses are embedded so they work offline. Longer texts are downloaded from the GitHub licenses API.
+$script:LicenseTemplates = @{
+    'mit' = @'
+MIT License
+
+Copyright (c) [year] [fullname]
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+'@
+    'bsd-3-clause' = @'
+BSD 3-Clause License
+
+Copyright (c) [year], [fullname]
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+'@
+    'bsd-2-clause' = @'
+BSD 2-Clause License
+
+Copyright (c) [year], [fullname]
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+'@
+    'isc' = @'
+ISC License
+
+Copyright (c) [year], [fullname]
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
+'@
+    'unlicense' = @'
+This is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or
+distribute this software, either in source code form or as a compiled
+binary, for any purpose, commercial or non-commercial, and by any
+means.
+
+In jurisdictions that recognize copyright laws, the author or authors
+of this software dedicate any and all copyright interest in the
+software to the public domain. We make this dedication for the benefit
+of the public at large and to the detriment of our heirs and
+successors. We intend this dedication to be an overt act of
+relinquishment in perpetuity of all present and future rights to this
+software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <https://unlicense.org>
+'@
 }
 
 # ---------------------------------------------------------------------------
@@ -604,14 +781,16 @@ function New-CommitMessage {
 # ---------------------------------------------------------------------------
 
 function Resolve-BranchName {
-    param([string]$Requested)
+    param([string]$Requested, [string]$CurrentBranch)
     $name = $Requested
     while ($true) {
         if ([string]::IsNullOrWhiteSpace($name)) {
-            $name = Read-Host 'Имя новой ветки (например, feat/home-swiper)'
+            Write-Host ('Текущая ветка: {0}' -f $CurrentBranch) -ForegroundColor DarkGray
+            $name = Read-Host 'Имя новой ветки (например, feat/home-swiper). Напишите . чтобы остаться в текущей ветке'
             if ([string]::IsNullOrWhiteSpace($name)) { throw 'Имя ветки не указано. Операция отменена.' }
         }
         $name = $name.Trim()
+        if ($name -eq '.') { return '.' }
 
         $valid = Invoke-Git -GitArgs @('check-ref-format', '--branch', $name)
         if ($valid.ExitCode -ne 0) {
@@ -833,20 +1012,38 @@ function Initialize-Config {
 function Show-Help {
     Write-Host ''
     Write-Host 'AI Git Flow' -ForegroundColor Cyan
-    Write-Host 'Ветка, коммиты и pull request на основе GigaChat'
+    Write-Host 'Git-ассистент на основе GigaChat'
     Write-Host ''
-    Write-Host 'Использование: aiflow [параметры]' -ForegroundColor White
+    Write-Host 'Использование: aiflow [команда] [параметры]' -ForegroundColor White
     Write-Host ''
+    Write-Host 'Команды' -ForegroundColor Cyan
+    $commands = @(
+        @('commit (по умолчанию)', 'ветка, коммиты, push и pull request'),
+        @('readme', 'сгенерировать README.md по содержимому репозитория'),
+        @('license', 'создать файл LICENSE (MIT, Apache-2.0, GPL-3.0 и другие)'),
+        @('issue "описание"', 'превратить заметку в структурированный issue на GitHub')
+    )
+    foreach ($row in $commands) {
+        Write-Host ('  {0,-24}' -f $row[0]) -NoNewline -ForegroundColor White
+        Write-Host $row[1] -ForegroundColor Gray
+    }
+    Write-Host ''
+    Write-Host 'Параметры' -ForegroundColor Cyan
     $rows = @(
-        @('-Branch, -b <имя>', 'имя новой ветки'),
-        @('-DryRun, -dry', 'показать план, ничего не менять'),
+        @('-Branch, -b <имя>', 'имя новой ветки; "." оставляет текущую ветку'),
+        @('-Stay, -here', 'не создавать ветку: коммит и push в текущую ветку'),
+        @('-DryRun, -dry', 'показать результат, ничего не менять'),
         @('-Yes, -y', 'не спрашивать подтверждение'),
-        @('-Lang en|ru', 'язык тем коммитов и описания PR'),
+        @('-Lang en|ru', 'язык текстов (коммиты, PR, README, issue)'),
         @('-Draft', 'создать PR как черновик'),
         @('-NoPr', 'не создавать pull request'),
         @('-NoPush', 'не отправлять ветку на сервер'),
         @('-Base <ветка>', 'базовая ветка для PR'),
-        @('-Model, -PrModel', 'модели GigaChat для коммитов и для PR'),
+        @('-Type <лицензия>', 'license: mit, apache-2.0, gpl-3.0, bsd-3-clause, isc ...'),
+        @('-Author, -Year', 'license: правообладатель и год'),
+        @('-Labels a,b', 'issue: метки'),
+        @('-Force', 'перезаписать LICENSE / README.md без вопроса'),
+        @('-Model, -PrModel', 'модели GigaChat для коротких текстов и для длинных'),
         @('-UseSystemProxy', 'использовать системный прокси'),
         @('-SkipCertCheck', 'отключить проверку TLS (небезопасно)'),
         @('-SetKey', 'сохранить ключ авторизации GigaChat'),
@@ -854,7 +1051,7 @@ function Show-Help {
         @('-Help', 'эта справка')
     )
     foreach ($row in $rows) {
-        Write-Host ('  {0,-22}' -f $row[0]) -NoNewline -ForegroundColor White
+        Write-Host ('  {0,-24}' -f $row[0]) -NoNewline -ForegroundColor White
         Write-Host $row[1] -ForegroundColor Gray
     }
     Write-Host ''
@@ -918,6 +1115,705 @@ function Set-ImperativeSubject {
 }
 
 # ---------------------------------------------------------------------------
+# Repository helpers shared by all commands
+# ---------------------------------------------------------------------------
+
+function Write-Banner {
+    param([string]$Subtitle)
+    Write-Host ''
+    Write-Host 'AI Git Flow' -ForegroundColor Cyan
+    Write-Host $Subtitle -ForegroundColor DarkGray
+}
+
+function Enter-Repository {
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'Git не найден в PATH.' }
+    $inside = Invoke-Git -GitArgs @('rev-parse', '--is-inside-work-tree')
+    if ($inside.ExitCode -ne 0) { throw 'Текущая папка не является Git-репозиторием.' }
+    $root = (Invoke-GitChecked -GitArgs @('rev-parse', '--show-toplevel')).Out.Trim()
+    Push-Location -LiteralPath $root
+    return $root
+}
+
+function Confirm-Overwrite {
+    param([string]$Name)
+    if ($Force) { return $true }
+    $answer = Read-Host ('Файл {0} уже существует. Перезаписать? [y/N]' -f $Name)
+    return ($answer -match '^(y|yes|д|да)$')
+}
+
+function Get-RepositoryFiles {
+    $result = Invoke-GitChecked -GitArgs @('ls-files', '--cached', '--others', '--exclude-standard', '-z')
+    return @($result.Out.Split([char]0) | Where-Object { $_ })
+}
+
+function Resolve-GitUserName {
+    $result = Invoke-Git -GitArgs @('config', 'user.name')
+    if ($result.ExitCode -eq 0 -and $result.Out.Trim()) { return $result.Out.Trim() }
+    return $null
+}
+
+# ---------------------------------------------------------------------------
+# License
+# ---------------------------------------------------------------------------
+
+function Resolve-LicenseKey {
+    param([string]$Requested)
+    $keys = @($script:LicenseCatalog.Keys)
+
+    if (-not [string]::IsNullOrWhiteSpace($Requested)) {
+        $key = $Requested.Trim().ToLowerInvariant()
+        $aliases = @{
+            'apache' = 'apache-2.0'; 'apache2' = 'apache-2.0'; 'gpl' = 'gpl-3.0'; 'agpl' = 'agpl-3.0'
+            'lgpl' = 'lgpl-3.0'; 'mpl' = 'mpl-2.0'; 'bsd' = 'bsd-3-clause'; 'bsd-3' = 'bsd-3-clause'; 'bsd-2' = 'bsd-2-clause'
+        }
+        if ($aliases.ContainsKey($key)) { $key = $aliases[$key] }
+        if ($keys -contains $key) { return $key }
+        throw ('Неизвестный тип лицензии "{0}". Доступно: {1}' -f $Requested, ($keys -join ', '))
+    }
+
+    Write-Host ''
+    $index = 1
+    foreach ($key in $keys) {
+        Write-Host ('{0,2}. ' -f $index) -NoNewline -ForegroundColor DarkGray
+        Write-Host ('{0,-14}' -f $key) -NoNewline -ForegroundColor White
+        Write-Host $script:LicenseCatalog[$key].Description -ForegroundColor Gray
+        $index++
+    }
+    Write-Host ''
+    $answer = Read-Host 'Номер лицензии'
+    $number = 0
+    if (-not [int]::TryParse($answer, [ref]$number) -or $number -lt 1 -or $number -gt $keys.Count) {
+        throw 'Некорректный выбор лицензии.'
+    }
+    return $keys[$number - 1]
+}
+
+function Get-LicenseText {
+    param([string]$Key, [int]$YearValue, [string]$Holder)
+
+    if ($script:LicenseTemplates.ContainsKey($Key)) {
+        $body = $script:LicenseTemplates[$Key]
+    }
+    else {
+        try {
+            $response = Invoke-WebRequest -Uri ('https://api.github.com/licenses/' + $Key) -UserAgent 'ai-flow' `
+                -Headers @{ Accept = 'application/vnd.github+json' } -UseBasicParsing -TimeoutSec 30
+            $json = [System.Text.Encoding]::UTF8.GetString($response.RawContentStream.ToArray()) | ConvertFrom-Json
+            $body = [string]$json.body
+        }
+        catch {
+            throw ('Не удалось загрузить текст лицензии {0} с GitHub: {1} Попробуйте -UseSystemProxy или лицензию MIT, BSD, ISC, Unlicense (они работают офлайн).' -f $Key, $_.Exception.Message)
+        }
+        if ([string]::IsNullOrWhiteSpace($body)) { throw 'GitHub вернул пустой текст лицензии.' }
+    }
+
+    $body = $body.Replace('[year]', [string]$YearValue).Replace('[fullname]', $Holder)
+    $body = ($body -replace "`r`n", "`n").TrimEnd() + "`n"
+    return $body
+}
+
+function Start-License {
+    Write-Banner -Subtitle 'Создание файла лицензии'
+    $root = Enter-Repository
+    try {
+        $key = Resolve-LicenseKey -Requested $Type
+
+        $holder = $Author
+        if ([string]::IsNullOrWhiteSpace($holder)) { $holder = Resolve-GitUserName }
+        if ([string]::IsNullOrWhiteSpace($holder)) { $holder = Read-Host 'Правообладатель (имя автора)' }
+        if ([string]::IsNullOrWhiteSpace($holder)) { throw 'Правообладатель не указан.' }
+
+        $text = Get-LicenseText -Key $key -YearValue $Year -Holder $holder.Trim()
+
+        if ($DryRun) {
+            Write-Section 'Предпросмотр (DryRun)'
+            Write-Host $text
+            return 0
+        }
+
+        $target = 'LICENSE'
+        foreach ($candidate in @('LICENSE', 'LICENSE.md', 'LICENSE.txt')) {
+            if (Test-Path -LiteralPath (Join-Path $root $candidate)) { $target = $candidate; break }
+        }
+        $path = Join-Path $root $target
+        if ((Test-Path -LiteralPath $path) -and -not (Confirm-Overwrite -Name $target)) {
+            Write-Info 'Операция отменена.'
+            return 0
+        }
+
+        [System.IO.File]::WriteAllText($path, $text, $script:Utf8NoBom)
+        Write-Ok ('Файл {0} создан: лицензия {1}, правообладатель {2}, год {3}' -f $target, $key, $holder.Trim(), $Year)
+        Write-Info 'Закоммитить и отправить файл можно командой: aiflow'
+        return 0
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+# ---------------------------------------------------------------------------
+# README
+# ---------------------------------------------------------------------------
+
+function Format-ProjectTree {
+    param([string[]]$Files)
+
+    $tee = ([string][char]0x251C) + (([string][char]0x2500) * 2) + ' '
+    $elbow = ([string][char]0x2514) + (([string][char]0x2500) * 2) + ' '
+    $pipe = ([string][char]0x2502) + '   '
+
+    $skip = '(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|composer\.lock|poetry\.lock|Cargo\.lock|go\.sum|\.gitattributes)$'
+    $paths = @($Files | Where-Object { $_ -notmatch $skip })
+
+    $top = [ordered]@{}
+    foreach ($path in $paths) {
+        $parts = $path.Split('/')
+        $first = $parts[0]
+        if ($parts.Length -eq 1) {
+            if (-not $top.Contains($first)) { $top[$first] = $null }
+            continue
+        }
+        if (-not $top.Contains($first) -or $null -eq $top[$first]) {
+            $top[$first] = New-Object System.Collections.Specialized.OrderedDictionary
+        }
+        $second = $parts[1]
+        if ($parts.Length -gt 2) { $second = $second + '/' }
+        if (-not $top[$first].Contains($second)) { $top[$first].Add($second, $true) }
+    }
+
+    $names = @($top.Keys | Sort-Object @{ Expression = { $null -eq $top[$_] } }, @{ Expression = { $_ } })
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('.')
+
+    $limit = 25
+    $shown = @($names | Select-Object -First $limit)
+    for ($i = 0; $i -lt $shown.Count; $i++) {
+        $name = $shown[$i]
+        $isLast = ($i -eq $shown.Count - 1) -and ($names.Count -le $limit)
+        $branch = $tee
+        if ($isLast) { $branch = $elbow }
+
+        $children = $top[$name]
+        if ($null -eq $children) {
+            $lines.Add($branch + $name)
+            continue
+        }
+        $lines.Add($branch + $name + '/')
+
+        $childPrefix = $pipe
+        if ($isLast) { $childPrefix = '    ' }
+        $childNames = @($children.Keys | Sort-Object @{ Expression = { -not $_.EndsWith('/') } }, @{ Expression = { $_ } })
+        $childShown = @($childNames | Select-Object -First 8)
+        for ($j = 0; $j -lt $childShown.Count; $j++) {
+            $childLast = ($j -eq $childShown.Count - 1) -and ($childNames.Count -le 8)
+            $childBranch = $tee
+            if ($childLast) { $childBranch = $elbow }
+            $lines.Add($childPrefix + $childBranch + $childShown[$j])
+        }
+        if ($childNames.Count -gt 8) { $lines.Add($childPrefix + $elbow + '...') }
+    }
+    if ($names.Count -gt $limit) { $lines.Add($elbow + '...') }
+    return ($lines -join "`n")
+}
+
+function Get-ProjectInfo {
+    param([string]$Root, [string[]]$Files)
+
+    $description = $null
+    $languages = New-Object System.Collections.Generic.List[string]
+    $stack = New-Object System.Collections.Generic.List[string]
+    $prereqs = New-Object System.Collections.Generic.List[string]
+    $install = New-Object System.Collections.Generic.List[string]
+    $usage = New-Object System.Collections.Generic.List[object]
+
+    $extMap = @{
+        '.ts' = 'TypeScript'; '.tsx' = 'TypeScript'; '.js' = 'JavaScript'; '.jsx' = 'JavaScript'; '.mjs' = 'JavaScript'
+        '.vue' = 'Vue'; '.py' = 'Python'; '.cs' = 'C#'; '.php' = 'PHP'; '.java' = 'Java'; '.go' = 'Go'; '.rs' = 'Rust'
+        '.html' = 'HTML'; '.css' = 'CSS'; '.scss' = 'Sass'; '.sass' = 'Sass'; '.sql' = 'SQL'; '.ps1' = 'PowerShell'
+    }
+    $counts = @{}
+    foreach ($file in $Files) {
+        $ext = [System.IO.Path]::GetExtension($file).ToLowerInvariant()
+        if ($extMap.ContainsKey($ext)) {
+            $lang = $extMap[$ext]
+            if ($counts.ContainsKey($lang)) { $counts[$lang] = $counts[$lang] + 1 } else { $counts[$lang] = 1 }
+        }
+    }
+    foreach ($entry in @($counts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 6)) {
+        $languages.Add($entry.Key)
+    }
+
+    if ($Files -contains 'package.json') {
+        try {
+            $pkg = Get-Content -LiteralPath (Join-Path $Root 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($pkg.description) { $description = [string]$pkg.description }
+
+            $depNames = @()
+            foreach ($section in @('dependencies', 'devDependencies')) {
+                $block = $pkg.$section
+                if ($block) { $depNames += @($block.PSObject.Properties.Name) }
+            }
+            $stackMap = [ordered]@{
+                'react' = 'React'; 'vue' = 'Vue'; 'svelte' = 'Svelte'; '@angular/core' = 'Angular'; 'next' = 'Next.js'
+                'nuxt' = 'Nuxt'; 'typescript' = 'TypeScript'; 'vite' = 'Vite'; 'webpack' = 'webpack'; 'express' = 'Express'
+                'tailwindcss' = 'Tailwind CSS'; 'sass' = 'Sass'; 'react-router-dom' = 'React Router'; 'pinia' = 'Pinia'
+                'vuex' = 'Vuex'; '@reduxjs/toolkit' = 'Redux Toolkit'; 'redux' = 'Redux'; 'axios' = 'Axios'; 'swiper' = 'Swiper'
+                'three' = 'Three.js'; 'vitest' = 'Vitest'; 'jest' = 'Jest'; 'eslint' = 'ESLint'; 'prettier' = 'Prettier'
+            }
+            foreach ($dep in $stackMap.Keys) {
+                if ($depNames -contains $dep) { $stack.Add($stackMap[$dep]) }
+            }
+
+            $pm = 'npm'
+            if ($Files -contains 'yarn.lock') { $pm = 'yarn' }
+            elseif ($Files -contains 'pnpm-lock.yaml') { $pm = 'pnpm' }
+            $prereqs.Add('Node.js (LTS)')
+            $install.Add($pm + ' install')
+
+            $scriptNames = @()
+            if ($pkg.scripts) { $scriptNames = @($pkg.scripts.PSObject.Properties.Name) }
+            $wanted = @(
+                @{ Label = 'Dev'; Names = @('dev', 'start', 'serve') },
+                @{ Label = 'Build'; Names = @('build') },
+                @{ Label = 'Test'; Names = @('test') },
+                @{ Label = 'Lint'; Names = @('lint') }
+            )
+            foreach ($item in $wanted) {
+                foreach ($scriptName in $item.Names) {
+                    if ($scriptNames -contains $scriptName) {
+                        if ($pm -eq 'npm') {
+                            if ($scriptName -eq 'start' -or $scriptName -eq 'test') { $command = 'npm ' + $scriptName }
+                            else { $command = 'npm run ' + $scriptName }
+                        }
+                        else { $command = $pm + ' ' + $scriptName }
+                        $usage.Add([pscustomobject]@{ LabelKey = $item.Label; Command = $command })
+                        break
+                    }
+                }
+            }
+        }
+        catch { }
+    }
+
+    if ($Files -contains 'requirements.txt') {
+        $prereqs.Add('Python 3')
+        $install.Add('pip install -r requirements.txt')
+    }
+    foreach ($entry in @('main.py', 'app.py')) {
+        if ($Files -contains $entry) {
+            $usage.Add([pscustomobject]@{ LabelKey = 'Run'; Command = ('python ' + $entry) })
+            break
+        }
+    }
+    if (@($Files | Where-Object { $_ -match '\.(csproj|sln)$' }).Count -gt 0) {
+        $prereqs.Add('.NET SDK')
+        $install.Add('dotnet restore')
+        $usage.Add([pscustomobject]@{ LabelKey = 'Build'; Command = 'dotnet build' })
+        $usage.Add([pscustomobject]@{ LabelKey = 'Run'; Command = 'dotnet run' })
+    }
+    if ($Files -contains 'composer.json') {
+        $prereqs.Add('PHP, Composer')
+        $install.Add('composer install')
+    }
+    if ($usage.Count -eq 0 -and $install.Count -eq 0 -and ($Files -contains 'index.html')) {
+        $usage.Add([pscustomobject]@{ LabelKey = 'OpenHtml'; Command = '' })
+    }
+
+    if (@($Files | Where-Object { $_ -match '(^|/)dockerfile' }).Count -gt 0) { $stack.Add('Docker') }
+    if (@($Files | Where-Object { $_ -match '^\.github/workflows/' }).Count -gt 0) { $stack.Add('GitHub Actions') }
+
+    $combined = New-Object System.Collections.Generic.List[string]
+    foreach ($item in (@($languages) + @($stack))) {
+        if ($combined -notcontains $item) { $combined.Add($item) }
+    }
+
+    return [pscustomobject]@{
+        Name        = (Split-Path -Leaf $Root)
+        Description = $description
+        Stack       = @($combined | Select-Object -First 12)
+        Prereqs     = @($prereqs)
+        Install     = @($install)
+        Usage       = @($usage)
+    }
+}
+
+function Get-ProjectExcerpt {
+    param([string]$Root, [string[]]$Files)
+    $patterns = @('^index\.html$', '^src/main\.[a-z]+$', '^src/index\.[a-z]+$', '^src/App\.[a-z]+$', '^(main|app)\.py$', '^(index|server|app)\.js$', '^Program\.cs$')
+    $chosen = New-Object System.Collections.Generic.List[string]
+    foreach ($pattern in $patterns) {
+        if ($chosen.Count -ge 3) { break }
+        $match = @($Files | Where-Object { $_ -match $pattern } | Select-Object -First 1)
+        if ($match.Count -gt 0 -and $match[0]) { $chosen.Add($match[0]) }
+    }
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($file in $chosen) {
+        try {
+            $text = (Get-Content -LiteralPath (Join-Path $Root $file) -TotalCount 60 -Encoding UTF8) -join "`n"
+            if ($text.Length -gt 1500) { $text = $text.Substring(0, 1500) }
+            $parts.Add('--- ' + $file + ' ---' + "`n" + $text)
+        }
+        catch { }
+    }
+    return ($parts -join "`n`n")
+}
+
+function Get-ReadmeStrings {
+    if ($Lang -eq 'ru') {
+        return @{
+            Features = 'Возможности'; Stack = 'Стек технологий'; Start = 'Быстрый старт'; Prereq = 'Требования'
+            Install = 'Установка'; Usage = 'Использование'; Structure = 'Структура проекта'; License = 'Лицензия'
+            Dev = 'Запуск в режиме разработки'; Build = 'Сборка'; Test = 'Тесты'; Lint = 'Проверка кода'; Run = 'Запуск'
+            OpenHtml = 'Откройте файл index.html в браузере'
+            Licensed = 'Распространяется под лицензией {0}. Подробности в файле [{1}]({1}).'
+            LicenseRef = 'Подробности в файле [{0}]({0}).'
+            Fallback = 'Проект {0}.'
+        }
+    }
+    return @{
+        Features = 'Features'; Stack = 'Tech stack'; Start = 'Getting started'; Prereq = 'Prerequisites'
+        Install = 'Installation'; Usage = 'Usage'; Structure = 'Project structure'; License = 'License'
+        Dev = 'Development server'; Build = 'Build'; Test = 'Tests'; Lint = 'Linting'; Run = 'Run'
+        OpenHtml = 'Open index.html in a browser'
+        Licensed = 'Distributed under the {0}. See [{1}]({1}) for details.'
+        LicenseRef = 'See [{0}]({0}) for details.'
+        Fallback = 'The {0} project.'
+    }
+}
+
+function Get-ReadmeNarrative {
+    param($Info, [string]$Tree, [string]$Excerpt)
+
+    $treeText = $Tree
+    if ($treeText.Length -gt 3000) { $treeText = $treeText.Substring(0, 3000) }
+
+    $prompt = (@(
+        'Analyse the repository summary below and write two things for its README file.',
+        'Output format, plain text without markdown headings:',
+        'DESCRIPTION: one or two sentences describing what the project is and does.',
+        'FEATURES:',
+        '- three to six short bullet points describing what the project offers',
+        'Rules:',
+        'Describe only what is visible in the input. Do not invent features, URLs, badges, authors or installation steps.',
+        'If the purpose is unclear, state what the files show (for example, a static website built with HTML and CSS) and use fewer bullet points.',
+        ('Language: {0}.' -f (Get-LanguageName)),
+        '',
+        ('Project name: ' + $Info.Name),
+        ('Technologies detected: ' + ($Info.Stack -join ', ')),
+        ('Existing description: ' + $Info.Description),
+        '',
+        'File tree:',
+        $treeText,
+        '',
+        'Key file excerpts:',
+        $Excerpt
+    )) -join "`n"
+
+    $system = 'You write accurate, concise README content for software projects. You never invent facts.'
+    try {
+        $answer = Invoke-GigaChat -SystemPrompt $system -UserPrompt $prompt -ModelName $PrModel -MaxTokens 500
+    }
+    catch {
+        Write-Warn ('Не удалось сгенерировать описание: {0}' -f $_.Exception.Message)
+        return [pscustomobject]@{ Description = $null; Features = @() }
+    }
+
+    $description = $null
+    if ($answer -match '(?is)DESCRIPTION:\s*(.+?)\s*(?:FEATURES:|$)') { $description = $Matches[1].Trim() }
+    $features = @($answer -split "`r?`n" |
+        Where-Object { $_ -match '^\s*(?:[-*]|\d+\.)\s+\S' } |
+        ForEach-Object { ($_ -replace '^\s*(?:[-*]|\d+\.)\s+', '').Trim() } |
+        Select-Object -First 6)
+    return [pscustomobject]@{ Description = $description; Features = $features }
+}
+
+function New-ReadmeText {
+    param($Info, $Narrative, [string]$Tree, [string[]]$Files, [string]$Root)
+
+    $s = Get-ReadmeStrings
+    $out = New-Object System.Collections.Generic.List[string]
+
+    $out.Add('# ' + $Info.Name)
+    $out.Add('')
+    $description = $Info.Description
+    if ([string]::IsNullOrWhiteSpace($description)) { $description = $Narrative.Description }
+    if ([string]::IsNullOrWhiteSpace($description)) { $description = $s.Fallback -f $Info.Name }
+    $out.Add($description)
+    $out.Add('')
+
+    if (@($Narrative.Features).Count -gt 0) {
+        $out.Add('## ' + $s.Features)
+        $out.Add('')
+        foreach ($feature in $Narrative.Features) { $out.Add('- ' + $feature) }
+        $out.Add('')
+    }
+
+    if (@($Info.Stack).Count -gt 0) {
+        $out.Add('## ' + $s.Stack)
+        $out.Add('')
+        foreach ($item in $Info.Stack) { $out.Add('- ' + $item) }
+        $out.Add('')
+    }
+
+    $remote = Invoke-Git -GitArgs @('remote', 'get-url', $Remote)
+    $cloneUrl = $null
+    if ($remote.ExitCode -eq 0 -and $remote.Out.Trim()) {
+        # Never publish credentials embedded in a remote URL.
+        $cloneUrl = ($remote.Out.Trim() -replace '(?<=//)[^/@]+@', '')
+    }
+
+    $hasSteps = (@($Info.Install).Count -gt 0) -or (@($Info.Usage).Count -gt 0)
+    if ($hasSteps) {
+        $out.Add('## ' + $s.Start)
+        $out.Add('')
+        if (@($Info.Prereqs).Count -gt 0) {
+            $out.Add('### ' + $s.Prereq)
+            $out.Add('')
+            $out.Add('- Git')
+            foreach ($item in $Info.Prereqs) { $out.Add('- ' + $item) }
+            $out.Add('')
+        }
+        if ($cloneUrl -or @($Info.Install).Count -gt 0) {
+            $out.Add('### ' + $s.Install)
+            $out.Add('')
+            $out.Add('```bash')
+            if ($cloneUrl) {
+                $out.Add('git clone ' + $cloneUrl)
+                $out.Add('cd ' + (Split-Path -Leaf $Root))
+            }
+            foreach ($command in $Info.Install) { $out.Add($command) }
+            $out.Add('```')
+            $out.Add('')
+        }
+        if (@($Info.Usage).Count -gt 0) {
+            $out.Add('### ' + $s.Usage)
+            $out.Add('')
+            foreach ($entry in $Info.Usage) {
+                if ($entry.Command) { $out.Add('- ' + $s[$entry.LabelKey] + ': `' + $entry.Command + '`') }
+                else { $out.Add('- ' + $s[$entry.LabelKey]) }
+            }
+            $out.Add('')
+        }
+    }
+
+    $out.Add('## ' + $s.Structure)
+    $out.Add('')
+    $out.Add('```text')
+    $out.Add($Tree)
+    $out.Add('```')
+    $out.Add('')
+
+    $licenseFile = $null
+    foreach ($candidate in @('LICENSE', 'LICENSE.md', 'LICENSE.txt')) {
+        if ($Files -contains $candidate) { $licenseFile = $candidate; break }
+    }
+    if ($licenseFile) {
+        $out.Add('## ' + $s.License)
+        $out.Add('')
+        $licenseName = $null
+        try {
+            $firstLine = @(Get-Content -LiteralPath (Join-Path $Root $licenseFile) -TotalCount 5 -Encoding UTF8 |
+                Where-Object { $_.Trim() } | Select-Object -First 1)
+            if ($firstLine.Count -gt 0) {
+                $candidateName = $firstLine[0].Trim()
+                if ($candidateName -match 'unencumbered') { $licenseName = 'Unlicense' }
+                elseif ($candidateName.Length -le 60) { $licenseName = $candidateName }
+            }
+        }
+        catch { }
+        if ($licenseName) { $out.Add(($s.Licensed -f $licenseName, $licenseFile)) }
+        else { $out.Add(($s.LicenseRef -f $licenseFile)) }
+        $out.Add('')
+    }
+
+    return (($out -join "`n").TrimEnd() + "`n")
+}
+
+function Start-Readme {
+    Write-Banner -Subtitle 'Генерация README.md'
+    $root = Enter-Repository
+    try {
+        Write-Section '1. Анализ проекта'
+        $files = @(Get-RepositoryFiles)
+        if ($files.Count -eq 0) { throw 'В репозитории нет файлов для анализа.' }
+        $info = Get-ProjectInfo -Root $root -Files $files
+        $tree = Format-ProjectTree -Files $files
+        $excerpt = Get-ProjectExcerpt -Root $root -Files $files
+        Write-Info ('Файлов: {0}. Обнаружено технологий: {1}' -f $files.Count, @($info.Stack).Count)
+
+        Write-Section '2. Генерация описания'
+        Write-Info 'Авторизация в GigaChat...'
+        Get-AccessToken | Out-Null
+        $narrative = Get-ReadmeNarrative -Info $info -Tree $tree -Excerpt $excerpt
+        $text = New-ReadmeText -Info $info -Narrative $narrative -Tree $tree -Files $files -Root $root
+
+        if ($DryRun) {
+            Write-Section 'Предпросмотр (DryRun)'
+            Write-Host $text
+            return 0
+        }
+
+        $path = Join-Path $root 'README.md'
+        if ((Test-Path -LiteralPath $path) -and -not (Confirm-Overwrite -Name 'README.md')) {
+            Write-Info 'Операция отменена. Предпросмотр можно получить с параметром -DryRun.'
+            return 0
+        }
+        [System.IO.File]::WriteAllText($path, $text, $script:Utf8NoBom)
+        Write-Ok 'Файл README.md создан.'
+        Write-Info 'Проверьте текст и при необходимости отредактируйте, затем выполните: aiflow'
+        return 0
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Issue
+# ---------------------------------------------------------------------------
+
+function Start-Issue {
+    Write-Banner -Subtitle 'Создание issue на GitHub'
+    $root = Enter-Repository
+    try {
+        $request = $Text
+        if ([string]::IsNullOrWhiteSpace($request)) { $request = Read-Host 'Опишите проблему или задачу' }
+        if ([string]::IsNullOrWhiteSpace($request)) { throw 'Описание не указано.' }
+        $request = $request.Trim()
+
+        Write-Info 'Авторизация в GigaChat...'
+        Get-AccessToken | Out-Null
+
+        $branchName = (Invoke-Git -GitArgs @('rev-parse', '--abbrev-ref', 'HEAD')).Out.Trim()
+        $recent = (Invoke-Git -GitArgs @('log', '-5', '--pretty=format:%s')).Out
+        $topLevel = @(Get-RepositoryFiles | ForEach-Object { $_.Split('/')[0] } | Select-Object -Unique | Select-Object -First 40)
+
+        $prompt = (@(
+            'Turn the developer note below into a GitHub issue.',
+            'Output format, plain text, no code fences:',
+            'TYPE: one of bug, feature, task',
+            'TITLE: a concise title, at most 80 characters, no trailing period',
+            'BODY:',
+            '<issue body in markdown>',
+            'Body structure:',
+            '- bug: "## Description", "## Steps to reproduce", "## Expected behavior", "## Actual behavior"',
+            '- feature: "## Description", "## Motivation", "## Acceptance criteria" as a checklist',
+            '- task: "## Description", "## Tasks" as a checklist, "## Acceptance criteria" as a checklist',
+            'Rules:',
+            'Use only facts from the note. Where details are unknown, write "To be clarified." instead of inventing them.',
+            ('Language: {0}. Keep markdown headings in English.' -f (Get-LanguageName)),
+            '',
+            'Developer note:',
+            $request,
+            '',
+            ('Current branch: ' + $branchName),
+            'Recent commits:',
+            $recent,
+            ('Top-level files and folders: ' + ($topLevel -join ', '))
+        )) -join "`n"
+
+        $system = 'You are a careful engineering assistant who writes clear, factual GitHub issues.'
+        $answer = $null
+        try { $answer = Invoke-GigaChat -SystemPrompt $system -UserPrompt $prompt -ModelName $PrModel -MaxTokens 700 }
+        catch { Write-Warn ('Не удалось сгенерировать issue: {0}' -f $_.Exception.Message) }
+
+        $type = 'task'
+        $title = $null
+        $body = $null
+        if ($answer) {
+            if ($answer -match '(?im)^\s*TYPE:\s*(\w+)') {
+                $candidateType = $Matches[1].ToLowerInvariant()
+                if (@('bug', 'feature', 'task') -contains $candidateType) { $type = $candidateType }
+            }
+            if ($answer -match '(?im)^\s*TITLE:\s*(.+)$') { $title = $Matches[1].Trim() }
+
+            $lines = @($answer -split "`r?`n")
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match '^\s*BODY:\s*(.*)$') {
+                    $rest = New-Object System.Collections.Generic.List[string]
+                    if ($Matches[1]) { $rest.Add($Matches[1]) }
+                    foreach ($line in @($lines | Select-Object -Skip ($i + 1))) { $rest.Add($line) }
+                    $body = ($rest -join "`n").Trim()
+                    $body = $body -replace '^```(?:markdown|md)?\s*\n', '' -replace '\n```\s*$', ''
+                    break
+                }
+            }
+        }
+        if ($title) {
+            $title = $title.Trim().Trim([char]34, [char]39, [char]96).TrimEnd('.')
+            if ($title.Length -gt 80) { $title = $title.Substring(0, 80).Trim() }
+        }
+        if (-not $title) {
+            $title = $request
+            if ($title.Length -gt 70) { $title = $title.Substring(0, 70).Trim() }
+        }
+        if ([string]::IsNullOrWhiteSpace($body)) { $body = $request }
+
+        $labels = @()
+        if ($Labels) { $labels = @($Labels | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+        elseif ($type -eq 'bug') { $labels = @('bug') }
+        elseif ($type -eq 'feature') { $labels = @('enhancement') }
+
+        Write-Section 'Issue'
+        Write-Host $title -ForegroundColor White
+        if ($labels.Count -gt 0) { Write-Host ('Метки: ' + ($labels -join ', ')) -ForegroundColor DarkGray }
+        Write-Host ''
+        Write-Host $body
+        Write-Host ''
+
+        if ($DryRun) {
+            Write-Info 'Режим DryRun: issue не создан.'
+            return 0
+        }
+        if (-not $Yes) {
+            $confirm = Read-Host 'Создать issue? [Y/n]'
+            if ($confirm -match '^(n|no|н|нет)$') {
+                Write-Info 'Операция отменена.'
+                return 0
+            }
+        }
+
+        $gh = Get-Command gh -ErrorAction SilentlyContinue
+        $authenticated = $false
+        if ($gh) { $authenticated = ((Invoke-Native -Exe 'gh' -ArgList @('auth', 'status')).ExitCode -eq 0) }
+        if (-not $gh -or -not $authenticated) {
+            if (-not $gh) { Write-Warn 'GitHub CLI (gh) не найден. Установите его: https://cli.github.com' }
+            else { Write-Warn 'GitHub CLI не авторизован. Выполните: gh auth login' }
+            Write-Info 'Текст выше можно использовать для ручного создания issue.'
+            return 0
+        }
+
+        $bodyFile = [System.IO.Path]::GetTempFileName()
+        try {
+            [System.IO.File]::WriteAllText($bodyFile, ($body + "`n"), $script:Utf8NoBom)
+            $ghArgs = @('issue', 'create', '--title', $title, '--body-file', $bodyFile)
+            foreach ($label in $labels) { $ghArgs += @('--label', $label) }
+            $created = Invoke-Native -Exe 'gh' -ArgList $ghArgs
+
+            if ($created.ExitCode -ne 0 -and $labels.Count -gt 0 -and (($created.Err + $created.Out) -match 'label')) {
+                Write-Warn 'Метки отсутствуют в репозитории. Повторная попытка без меток.'
+                $ghArgs = @('issue', 'create', '--title', $title, '--body-file', $bodyFile)
+                $created = Invoke-Native -Exe 'gh' -ArgList $ghArgs
+            }
+            if ($created.ExitCode -ne 0) {
+                $details = $created.Err
+                if (-not $details) { $details = $created.Out }
+                throw ('Не удалось создать issue: {0}' -f $details)
+            }
+            $url = @($created.Out -split "`r?`n" | Where-Object { $_ -match '^https?://' } | Select-Object -Last 1)[0]
+            if ($url) { Write-Ok ('Issue создан: {0}' -f $url) } else { Write-Ok 'Issue создан.' }
+        }
+        finally {
+            Remove-Item -LiteralPath $bodyFile -Force -ErrorAction SilentlyContinue
+        }
+        return 0
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -935,12 +1831,7 @@ function Start-AiFlow {
     Write-Host 'AI Git Flow' -ForegroundColor Cyan
     Write-Host 'Ветка, коммиты и pull request на основе GigaChat' -ForegroundColor DarkGray
 
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'Git не найден в PATH.' }
-    $inside = Invoke-Git -GitArgs @('rev-parse', '--is-inside-work-tree')
-    if ($inside.ExitCode -ne 0) { throw 'Текущая папка не является Git-репозиторием.' }
-
-    $root = (Invoke-GitChecked -GitArgs @('rev-parse', '--show-toplevel')).Out.Trim()
-    Push-Location -LiteralPath $root
+    $root = Enter-Repository
     try {
         # 1. Analysis
         Write-Section '1. Анализ изменений'
@@ -997,9 +1888,20 @@ function Start-AiFlow {
 
         # 3. Branch
         Write-Section '3. Ветка'
-        $branchName = Resolve-BranchName -Requested $Branch
-        Invoke-GitChecked -GitArgs @('switch', '-c', $branchName) | Out-Null
-        Write-Ok ('Создана ветка {0}' -f $branchName)
+        if ($Stay) { $choice = '.' }
+        else { $choice = Resolve-BranchName -Requested $Branch -CurrentBranch $startBranch }
+
+        $stayOnBranch = ($choice -eq '.')
+        if ($stayOnBranch) {
+            if ($startBranch -eq 'HEAD') { throw 'Репозиторий в состоянии detached HEAD. Перейдите на ветку или создайте новую.' }
+            $branchName = $startBranch
+            Write-Info ('Остаёмся в ветке {0}, новая ветка не создаётся.' -f $branchName)
+        }
+        else {
+            $branchName = $choice
+            Invoke-GitChecked -GitArgs @('switch', '-c', $branchName) | Out-Null
+            Write-Ok ('Создана ветка {0}' -f $branchName)
+        }
 
         # 4. Commits
         Write-Section '4. Коммиты'
@@ -1046,7 +1948,10 @@ function Start-AiFlow {
             Invoke-GitChecked -GitArgs @('push', '-u', $Remote, $branchName) | Out-Null
             Write-Ok ('Ветка {0} отправлена в {1}' -f $branchName, $Remote)
 
-            if (-not $NoPr) {
+            if ($stayOnBranch) {
+                Write-Info 'Pull request не создаётся при работе в текущей ветке.'
+            }
+            elseif (-not $NoPr) {
                 New-PullRequest -BranchName $branchName -BaseBranch $baseBranch
             }
         }
@@ -1080,11 +1985,19 @@ if (Test-Path -LiteralPath $configPath) {
 }
 
 try {
-    if ($Help) { Show-Help; exit 0 }
+    if ($Help -or $Command -eq 'help') { Show-Help; exit 0 }
     if ($SetKey) { Save-AuthKey; exit 0 }
     if ($InitConfig) { Initialize-Config; exit 0 }
 
-    $exitCode = Start-AiFlow | Select-Object -Last 1
+    if (-not $UseSystemProxy) { [System.Net.WebRequest]::DefaultWebProxy = $null }
+    if ($SkipCertCheck -and $Command -ne 'commit') { Enable-InsecureCertificates }
+
+    switch ($Command) {
+        'readme'  { $exitCode = Start-Readme | Select-Object -Last 1 }
+        'license' { $exitCode = Start-License | Select-Object -Last 1 }
+        'issue'   { $exitCode = Start-Issue | Select-Object -Last 1 }
+        default   { $exitCode = Start-AiFlow | Select-Object -Last 1 }
+    }
     if ($null -eq $exitCode) { $exitCode = 0 }
 }
 catch {
