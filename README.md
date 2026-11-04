@@ -6,6 +6,13 @@
 > [!NOTE]
 > Буду рад вашим баг-репортам и Pull Request'ам!
 
+> [!TIP]
+> Есть кроссплатформенная версия на Node.js (Windows, macOS, Linux, несколько провайдеров моделей): [AI-Git-Flow-CLI](https://github.com/wildkodokushi/AI-Git-Flow-CLI). Она опубликована в npm и ставится одной командой:
+>
+> ```bash
+> npx ai-git-flow init
+> ```
+
 Консольная утилита для Windows, которая автоматизирует рутину вокруг Git и оформления проекта. Тексты пишет GigaChat API, всё остальное делает сам скрипт.
 
 После установки утилита запускается одним словом из любой папки репозитория:
@@ -34,6 +41,7 @@ aiflow issue "описание"     # создать issue на GitHub
 12. [Решение проблем](#решение-проблем)
 13. [Безопасность и приватность](#безопасность-и-приватность)
 14. [Обновление и удаление](#обновление-и-удаление)
+15. [Кроссплатформенная версия (Node.js)](#кроссплатформенная-версия-nodejs)
 
 ## Как это работает
 
@@ -385,3 +393,25 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
 ```powershell
 [Environment]::SetEnvironmentVariable('GIGACHAT_AUTH_KEY', $null, 'User')
 ```
+
+## Кроссплатформенная версия (Node.js)
+
+Для Windows, macOS и Linux есть вторая версия утилиты на Node.js: [AI-Git-Flow-CLI](https://github.com/wildkodokushi/AI-Git-Flow-CLI). Она опубликована в npm, поэтому ставится без скачивания файлов:
+
+```bash
+npx ai-git-flow init              # мастер настройки: провайдер, ключ, модель, проверка
+npm install -g ai-git-flow        # установить команду насовсем
+```
+
+После установки доступны команды `aigf` и `ai-git-flow`. Требуется Node.js 20 или новее.
+
+| | PowerShell-версия (этот репозиторий) | Node.js-версия |
+|---|---|---|
+| Платформы | Windows | Windows, macOS, Linux |
+| Установка | `install.ps1` из этого репозитория | `npx ai-git-flow init` или `npm install -g ai-git-flow` |
+| Команда | `aiflow` | `aigf` (или `ai-git-flow`) |
+| Модели | GigaChat | GigaChat, DeepSeek, Grok, OpenRouter, Groq, OpenAI, Ollama и любой OpenAI-совместимый API |
+| Проверка модели | нет | `aigf doctor` |
+| Требования | PowerShell 5.1 | Node.js 20+ |
+
+Команды у версий разные, поэтому их можно держать на одном компьютере одновременно. Ключ GigaChat из переменной `GIGACHAT_AUTH_KEY` Node.js-версия подхватывает сама, повторно вводить его не нужно. Сертификат Минцифры, установленный в Windows для этой версии, Node.js не использует: мастер `npx ai-git-flow init` скачает его отдельно. Основное развитие идёт в Node.js-версии, эта остаётся простым вариантом «один скрипт без зависимостей».
